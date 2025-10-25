@@ -91,10 +91,19 @@ jobs:
         
         print(f"\n✅ SUCCESS! {len(all_channels)} channels, {len(all_programmes)} programmes merged")
         EOF
+    
+    - name: Compress EPG
+      run: gzip -c merged_epg.xml > merged_epg.xml.gz
         
-    - name: Commit and push changes
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add merged_epg.xml
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Update EPG - $(date +'%Y-%m-%d %H:%M UTC')" && git push)
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: latest
+        name: Latest EPG
+        body: "EPG mis à jour automatiquement - $(date +'%Y-%m-%d %H:%M UTC')"
+        files: |
+          merged_epg.xml.gz
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
