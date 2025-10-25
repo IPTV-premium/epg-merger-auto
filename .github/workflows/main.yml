@@ -19,6 +19,7 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+        cache: 'pip'
         
     - name: Install dependencies
       run: pip install requests
@@ -30,6 +31,8 @@ jobs:
         import xml.etree.ElementTree as ET
         import gzip
         import time
+        from datetime import datetime
+        from collections import defaultdict
         
         EPG_URLS = [
             "https://myepg.top/?download_file=35078&order=wc_order_4oJUv9UXzRLoN&email=8ktv.tv%40gmail.com&key=e80183e4-2386-4f14-9a9f-426ba743864e",
@@ -37,73 +40,179 @@ jobs:
         ]
         
         def download_and_decompress(url, max_retries=3):
+            """Télécharge et décompresse un fichier EPG avec retry et timeout adaptatif"""
             for attempt in range(max_retries):
                 try:
-                    print(f"Downloading {url[:50]}... (attempt {attempt + 1}/{max_retries})")
-                    response = requests.get(url, timeout=90)
+                    timeout = 90 + (attempt * 30)  # Timeout augmente à chaque tentative
+                    print(f"📥 Downloading {url[:50]}... (attempt {attempt + 1}/{max_retries}, timeout={timeout}s)")
+                    
+                    response = requests.get(
+                        url, 
+                        timeout=timeout,
+                        headers={'User-Agent': 'EPG-Merger/2.0'},
+                        stream=True
+                    )
                     response.raise_for_status()
                     content = response.content
+                    
+                    # Décompression si gzip
                     if content[:2] == b'\x1f\x8b':
+                        print(f"🗜️  Decompressing gzip file...")
                         content = gzip.decompress(content)
+                    
+                    print(f"✅ Downloaded {len(content) / 1024 / 1024:.1f} MB")
                     return content
+                    
+                except requests.exceptions.Timeout:
+                    print(f"⏱️  Timeout on attempt {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        time.sleep(10)
+                    else:
+                        raise
                 except Exception as e:
-                    print(f"✗ Error on attempt {attempt + 1}: {e}")
+                    print(f"❌ Error on attempt {attempt + 1}: {type(e).__name__}: {e}")
                     if attempt < max_retries - 1:
                         time.sleep(5)
                     else:
                         raise
         
+        # Création de l'élément racine
         root = ET.Element("tv")
-        root.set("generator-info-name", "epg-auto-merger")
+        root.set("generator-info-name", "epg-auto-merger-v2")
         root.set("generator-info-url", "https://github.com/IPTV-premium/epg-merger-auto")
+        root.set("generated-ts", datetime.utcnow().isoformat() + "Z")
         
         all_channels = {}
-        all_programmes = []
+        all_programmes = {}  # Utilise dict pour déduplication
+        stats = {'total_channels': 0, 'total_programmes': 0, 'duplicates': 0}
         
+        print(f"\n🚀 Starting EPG merge process...")
+        print(f"📅 Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"🔗 Processing {len(EPG_URLS)} EPG sources\n")
+        
+        # Téléchargement et fusion des EPG
         for i, url in enumerate(EPG_URLS, 1):
             try:
+                print(f"\n{'='*60}")
+                print(f"📡 EPG Source #{i}")
+                print(f"{'='*60}")
+                
                 content = download_and_decompress(url)
                 tree = ET.fromstring(content)
                 
+                # Extraction des chaînes (sans doublons)
+                channels_count = 0
                 for channel in tree.findall("channel"):
                     channel_id = channel.get("id")
                     if channel_id and channel_id not in all_channels:
                         all_channels[channel_id] = channel
+                        channels_count += 1
                 
+                # Extraction des programmes avec déduplication avancée
                 programmes = tree.findall("programme")
-                all_programmes.extend(programmes)
+                programmes_count = 0
+                duplicates_count = 0
                 
-                print(f"✓ EPG {i}: {len(tree.findall('channel'))} channels, {len(programmes)} programmes")
+                for prog in programmes:
+                    # Clé unique : channel + start + stop
+                    prog_key = f"{prog.get('channel')}_{prog.get('start')}_{prog.get('stop')}"
+                    
+                    if prog_key not in all_programmes:
+                        all_programmes[prog_key] = prog
+                        programmes_count += 1
+                    else:
+                        duplicates_count += 1
+                
+                stats['total_channels'] += channels_count
+                stats['total_programmes'] += programmes_count
+                stats['duplicates'] += duplicates_count
+                
+                print(f"✅ EPG #{i} processed successfully:")
+                print(f"   📺 Channels: {channels_count} new (total: {len(all_channels)})")
+                print(f"   📋 Programmes: {programmes_count} new (duplicates skipped: {duplicates_count})")
+                
             except Exception as e:
-                print(f"✗ Failed to process EPG {i}: {e}")
+                print(f"❌ Failed to process EPG #{i}: {type(e).__name__}: {e}")
+                print(f"⚠️  Continuing with other sources...")
         
+        # Vérification qu'on a au moins des données
+        if not all_channels and not all_programmes:
+            raise Exception("❌ No data retrieved from any EPG source!")
+        
+        print(f"\n{'='*60}")
+        print(f"🔧 Building final EPG file...")
+        print(f"{'='*60}")
+        
+        # Assemblage du fichier XML final
         for channel in all_channels.values():
             root.append(channel)
-        for programme in all_programmes:
+        
+        for programme in all_programmes.values():
             root.append(programme)
         
         tree = ET.ElementTree(root)
         ET.indent(tree, space="  ")
         
+        # Écriture du fichier
+        print(f"💾 Writing XML file...")
         with open('merged_epg.xml', 'wb') as f:
             f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
             tree.write(f, encoding='utf-8', xml_declaration=False)
         
-        print(f"\n✅ SUCCESS! {len(all_channels)} channels, {len(all_programmes)} programmes merged")
+        import os
+        file_size_mb = os.path.getsize('merged_epg.xml') / 1024 / 1024
+        
+        print(f"\n{'='*60}")
+        print(f"✅ EPG MERGE COMPLETED SUCCESSFULLY!")
+        print(f"{'='*60}")
+        print(f"📺 Total unique channels: {len(all_channels)}")
+        print(f"📋 Total unique programmes: {len(all_programmes)}")
+        print(f"🗑️  Duplicates removed: {stats['duplicates']}")
+        print(f"📦 File size: {file_size_mb:.1f} MB")
+        print(f"⏰ Completed at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"{'='*60}\n")
+        
+        # Créer un fichier de stats
+        with open('stats.txt', 'w') as f:
+            f.write(f"EPG Statistics\n")
+            f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+            f.write(f"Channels: {len(all_channels)}\n")
+            f.write(f"Programmes: {len(all_programmes)}\n")
+            f.write(f"Duplicates removed: {stats['duplicates']}\n")
+            f.write(f"File size: {file_size_mb:.1f} MB\n")
+        
         EOF
     
-    - name: Compress EPG
-      run: gzip -c merged_epg.xml > merged_epg.xml.gz
+    - name: Compress EPG (optimized)
+      run: |
+        echo "🗜️  Compressing EPG file..."
+        gzip -9 -k merged_epg.xml
+        ls -lh merged_epg.xml*
+        
+    - name: Delete old releases
+      uses: dev-drprasad/delete-older-releases@v0.3.2
+      with:
+        keep_latest: 1
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: latest
-        name: Latest EPG
-        body: "EPG mis à jour automatiquement - $(date +'%Y-%m-%d %H:%M UTC')"
-        files: |
-          merged_epg.xml.gz
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: "📡 Latest EPG - ${{ github.run_number }}"
+        body: |
+          ## 📺 EPG fusionné automatiquement
+          
+          **Mis à jour le:** ${{ github.event.repository.updated_at }}
+          **Run #:** ${{ github.run_number }}
+          
+          ### 📥 Téléchargement:
+          - **Format XML** (non compressé) : `merged_epg.xml`
+          - **Format GZ** (compressé) : `merged_epg.xml.gz` ⚡ Recommandé
+          
+          ### 📊 Statistiques:
+          Voir le fichier `stats.txt` pour les détails
+          
+          ### 🔗 URL directe:
