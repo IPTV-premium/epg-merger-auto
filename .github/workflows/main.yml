@@ -1,0 +1,100 @@
+name: Update EPG
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: pip install requests
+      
+    - name: Download and merge EPG
+      run: |
+        python3 << 'EOF'
+        import requests
+        import xml.etree.ElementTree as ET
+        import gzip
+        import time
+        
+        EPG_URLS = [
+            "https://myepg.top/?download_file=35078&order=wc_order_4oJUv9UXzRLoN&email=8ktv.tv%40gmail.com&key=e80183e4-2386-4f14-9a9f-426ba743864e",
+            "https://myepg.top/?download_file=35078&order=wc_order_4oJUv9UXzRLoN&email=8ktv.tv%40gmail.com&key=9dc267c7-0de7-4198-9387-5d69a7deb4a0"
+        ]
+        
+        def download_and_decompress(url, max_retries=3):
+            for attempt in range(max_retries):
+                try:
+                    print(f"Downloading {url[:50]}... (attempt {attempt + 1}/{max_retries})")
+                    response = requests.get(url, timeout=90)
+                    response.raise_for_status()
+                    content = response.content
+                    if content[:2] == b'\x1f\x8b':
+                        content = gzip.decompress(content)
+                    return content
+                except Exception as e:
+                    print(f"✗ Error on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                    else:
+                        raise
+        
+        root = ET.Element("tv")
+        root.set("generator-info-name", "epg-auto-merger")
+        root.set("generator-info-url", "https://github.com/IPTV-premium/epg-merger-auto")
+        
+        all_channels = {}
+        all_programmes = []
+        
+        for i, url in enumerate(EPG_URLS, 1):
+            try:
+                content = download_and_decompress(url)
+                tree = ET.fromstring(content)
+                
+                for channel in tree.findall("channel"):
+                    channel_id = channel.get("id")
+                    if channel_id and channel_id not in all_channels:
+                        all_channels[channel_id] = channel
+                
+                programmes = tree.findall("programme")
+                all_programmes.extend(programmes)
+                
+                print(f"✓ EPG {i}: {len(tree.findall('channel'))} channels, {len(programmes)} programmes")
+            except Exception as e:
+                print(f"✗ Failed to process EPG {i}: {e}")
+        
+        for channel in all_channels.values():
+            root.append(channel)
+        for programme in all_programmes:
+            root.append(programme)
+        
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="  ")
+        
+        with open('merged_epg.xml', 'wb') as f:
+            f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+            tree.write(f, encoding='utf-8', xml_declaration=False)
+        
+        print(f"\n✅ SUCCESS! {len(all_channels)} channels, {len(all_programmes)} programmes merged")
+        EOF
+        
+    - name: Commit and push changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add merged_epg.xml
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Update EPG - $(date +'%Y-%m-%d %H:%M UTC')" && git push)
